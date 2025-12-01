@@ -3,7 +3,7 @@ import torch
 import numpy as np
 from drone_pointpillars.model import PointPillars
 from drone_pointpillars.utils import keep_bbox_from_lidar_range
-from drone_pointpillars.utils import drone_io  # Added to load point cloud data
+from drone_pointpillars.utils import drone_io
 
 def point_range_filter(pts, point_range=[0, -40, -40, 70, 40, 40]):
     '''
@@ -40,6 +40,7 @@ def load_model_checkpoint(trained_path, model):
     else:
         state = ckpt
 
+    # Load state dict
     model.load_state_dict(state, strict=False)
     print("Checkpoint loaded successfully.")
 
@@ -50,7 +51,7 @@ def main():
     # Path to the uploaded demo point cloud file
     pcd_path = os.path.join(script_dir, 'drone_pointpillars', 'dataset', 'demo_data', 'test', '000002.bin')
     
-    # Path to the uploaded model checkpoint (epoch_160.pth)
+    # Path to the uploaded model checkpoint
     trained_path = os.path.join(script_dir, 'pretrained', 'epoch_160.pth')
 
     if not os.path.exists(pcd_path):
@@ -64,12 +65,13 @@ def main():
     # Parameters
     pcd_limit_range = np.array([0, -40, -40, 70, 40, 40], dtype=np.float32)
 
-    # Init model (Using default configuration for inference)
-    # Using cpu/cuda based on availability
+    # Init model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    model = PointPillars(nclasses=1).to(device)
+    # CHANGED: nclasses=3 to match the checkpoint weights (18 channels)
+    model = PointPillars(nclasses=3).to(device)
+    
     load_model_checkpoint(trained_path, model)
     model.eval()
 
@@ -88,7 +90,7 @@ def main():
         if isinstance(result, list):
             result = result[0]
 
-        # Remove predictions which is out of range
+        # Remove predictions which are out of range
         result_filter = keep_bbox_from_lidar_range(result, pcd_limit_range)
 
         # Split up results
@@ -99,7 +101,8 @@ def main():
         print(f"Detected {len(labels)} objects.")
         if len(labels) > 0:
             print("Scores:", scores.cpu().numpy())
-            print("BBoxes:", lidar_bboxes.cpu().numpy())
+            print("Labels:", labels.cpu().numpy())
+            print("BBoxes (x, y, z, w, l, h, rot):\n", lidar_bboxes.cpu().numpy())
         else:
             print("No objects detected in this frame.")
 
