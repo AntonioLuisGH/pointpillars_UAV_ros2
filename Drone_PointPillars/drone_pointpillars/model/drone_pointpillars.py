@@ -249,13 +249,7 @@ class PointPillars(nn.Module):
         # anchors
         # Ranges is defined as [x_min, y_min, z_min, x_max, y_max, z_max]
         ranges = [[0, -39.68, -0.6, 69.12, 39.68, -0.6]] # Drones. 
-        #[0, -39.68, -0.6, 69.12, 39.68, -0.6]] # for pedestrian. 
-        #[0, -39.68, -0.6, 69.12, 39.68, -0.6], # for cyclist
-        #[0, -39.68, -1.78, 69.12, 39.68, -1.78]] # for car
         sizes = [[0.6, 0.8, 0.5]] # Drones.
-        #[0.6, 0.8, 1.73]] # for pedestrian.
-        #[0.6, 1.76, 1.73] # for cyclist
-        #[1.6, 3.9, 1.56]] # for car
         rotations=[0, 1.57]
         self.anchors_generator = Anchors(ranges=ranges, 
                                          sizes=sizes, 
@@ -266,11 +260,6 @@ class PointPillars(nn.Module):
             {'pos_iou_thr': 0.5, 'neg_iou_thr': 0.35, 'min_iou_thr': 0.35}, # Drone intersection over union thresholds for positive, negative, and minimum iou for assignment (During training).
         ]
         
-        # Had to remove these for the drone setup (with only one class), since the anchor generator uses the size of self.assigners to generate anchors groups.
-        # {'pos_iou_thr': 0.5, 'neg_iou_thr': 0.35, 'min_iou_thr': 0.35}, # I think this is for the pedestrian class
-        # {'pos_iou_thr': 0.5, 'neg_iou_thr': 0.35, 'min_iou_thr': 0.35},
-        # {'pos_iou_thr': 0.6, 'neg_iou_thr': 0.45, 'min_iou_thr': 0.45},
-
         # val and test
         self.nms_pre = 100
         self.nms_thr = 0.01
@@ -279,7 +268,7 @@ class PointPillars(nn.Module):
 
     def get_predicted_bboxes_single(self, bbox_cls_pred, bbox_pred, bbox_dir_cls_pred, anchors):
         '''
-        bbox_cls_pred: (n_anchors*3, 248, 216) # now its n_anchors*1
+        bbox_cls_pred: (n_anchors*3, 248, 216) 
         bbox_pred: (n_anchors*7, 248, 216)
         bbox_dir_cls_pred: (n_anchors*2, 248, 216)
         anchors: (y_l, x_l, 3, 2, 7)
@@ -385,46 +374,18 @@ class PointPillars(nn.Module):
         return results
 
     def forward(self, batched_pts, mode='test', batched_gt_bboxes=None, batched_gt_labels=None):
-
-        # batched_gt_bboxes: list[tensor], len(batched_gt_bboxes) = bs
-        # - each tensor: (num_gt_bboxes, 7), (x, y, z, l, w, h, ry)
-        # - 
-
-        # batched_pts: (bs, num_points, 4) 
-        # - bs: number of frames in the batch on this gpu (specified in drone_train)
-        # - num_points: number of points in the frame (can be different for each frame)
-        # - 4: x, y, z, intensity of each point
-
-        batch_size = len(batched_pts) # bs: Number of frames in the batch on this gpu (specified in drone_train)
+        batch_size = len(batched_pts)
     
-        # Here we make the pillars, we lump them all into one tensor (p1 + p2... pb) for efficiency. But we keep track of which pillar belongs to which frame using coors_batch (batch_idx).
-        # batched_pts: list[tensor] -> pillars: (p1 + p2 + ... + pb, num_points, c), Info about pillars (number of pillars in total, num points per pillar, decorated points = 9)
-        #                              coors_batch: (p1 + p2 + ... + pb, 1 + 3), This tensor tells the network which frame and which voxel coordinate each pillar belongs to. (pb: number of pillars in total, 1+3: [batch_idx, z, y, x])
-        #                              num_points_per_pillar: (p1 + p2 + ... + pb, ), This tensor tells the network how many points are in each pillar.
         pillars, coors_batch, npoints_per_pillar = self.pillar_layer(batched_pts)
-        
-        # pillars: (p1 + p2 + ... + pb, num_points, c), 
-        # coors_batch: (p1 + p2 + ... + pb, 1 + 3)
-        # npoints_per_pillar: (p1 + p2 + ... + pb, nr)
-        #                     -> pillar_features: (bs, out_channel, y_l, x_l)
         pillar_features = self.pillar_encoder(pillars, coors_batch, npoints_per_pillar)
-
-        # xs:  [(bs, 64, 248, 216), (bs, 128, 124, 108), (bs, 256, 62, 54)]
         xs = self.backbone(pillar_features)
-
-        # x: (bs, 384, 248, 216)
         x = self.neck(xs)
-
-        # bbox_cls_pred: (bs, n_anchors*3, 248, 216)  # now its n_anchors*1
-        # bbox_pred: (bs, n_anchors*7, 248, 216)
-        # bbox_dir_cls_pred: (bs, n_anchors*2, 248, 216)
         bbox_cls_pred, bbox_pred, bbox_dir_cls_pred = self.head(x)
         
-        # anchors
         device = bbox_cls_pred.device
         feature_map_size = torch.tensor(list(bbox_cls_pred.size()[-2:]), device=device)
-        anchors = self.anchors_generator.get_multi_anchors(feature_map_size) # Generates the full anchor grid for all classes/sizes/rotations for one frame.
-        batched_anchors = [anchors for _ in range(batch_size)] # Duplicate anchors for each frame, so we have the same anchor grid for each frame in the batch.
+        anchors = self.anchors_generator.get_multi_anchors(feature_map_size)
+        batched_anchors = [anchors for _ in range(batch_size)]
 
         if mode == 'train':
             anchor_target_dict = anchor_target(batched_anchors=batched_anchors, 
@@ -432,7 +393,6 @@ class PointPillars(nn.Module):
                                                batched_gt_labels=batched_gt_labels, 
                                                assigners=self.assigners,
                                                nclasses=self.nclasses)
-            
             return bbox_cls_pred, bbox_pred, bbox_dir_cls_pred, anchor_target_dict
         
         elif mode == 'val':
@@ -449,4 +409,4 @@ class PointPillars(nn.Module):
                                                 batched_anchors=batched_anchors)
             return results
         else:
-            raise ValueError   
+            raise ValueError
