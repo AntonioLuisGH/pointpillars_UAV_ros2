@@ -1,11 +1,13 @@
-import torch 
+import os
+import torch
 import numpy as np
 from drone_pointpillars.model import PointPillars
 from drone_pointpillars.utils import keep_bbox_from_lidar_range
+from drone_pointpillars.utils import drone_io  # Added to load point cloud data
 
 def point_range_filter(pts, point_range=[0, -40, -40, 70, 40, 40]):
     '''
-    data_dict: dict(pts, gt_bboxes_3d, gt_labels, gt_names, difficulty)
+    pts: numpy array of points
     point_range: [x1, y1, z1, x2, y2, z2]
     '''
     flag_x_low = pts[:, 0] > point_range[0]
@@ -18,8 +20,12 @@ def point_range_filter(pts, point_range=[0, -40, -40, 70, 40, 40]):
     pts = pts[keep_mask]
     return pts 
 
-def load_model_checkpoint(trained_path,model):
-    ckpt = torch.load(trained_path)
+def load_model_checkpoint(trained_path, model):
+    if not os.path.exists(trained_path):
+        print(f"Error: Checkpoint not found at {trained_path}")
+        return
+
+    ckpt = torch.load(trained_path, map_location='cpu')
 
     # Load weights
     if isinstance(ckpt, dict):
@@ -30,46 +36,72 @@ def load_model_checkpoint(trained_path,model):
             elif 'model_state_dict' in ckpt:
                 state = ckpt['model_state_dict']
             else:
-                # assume whole dict is a state_dict
                 state = ckpt
     else:
-        # old-style: ckpt *is* the state_dict
         state = ckpt
 
-    model.load_state_dict(state)
+    model.load_state_dict(state, strict=False)
+    print("Checkpoint loaded successfully.")
 
 def main():
-    point_cloud = {}  # Replace with actual point cloud data loading
+    # Get the directory where this script is located
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Path to the uploaded demo point cloud file
+    pcd_path = os.path.join(script_dir, 'drone_pointpillars', 'dataset', 'demo_data', 'test', '000002.bin')
+    
+    # Path to the uploaded model checkpoint (epoch_160.pth)
+    trained_path = os.path.join(script_dir, 'pretrained', 'epoch_160.pth')
+
+    if not os.path.exists(pcd_path):
+        print(f"File not found: {pcd_path}")
+        return
+
+    # Load the point cloud using the utility function
+    pc = drone_io.read_points(pcd_path)
+    print(f"Loaded point cloud with {pc.shape[0]} points.")
 
     # Parameters
     pcd_limit_range = np.array([0, -40, -40, 70, 40, 40], dtype=np.float32)
 
-    # Init model (Choose small or large model)
-    if True:
-        # Ssmall model 
-        trained_path = "/home/antonio/workspaces/pointpillars_UAV_ros2_ws/models_and_datasets/APointPillars_Results_10/checkpoints/epoch_10.pth" 
-        model = PointPillars(nclasses=1).cuda()
-    else:
-        # Large model
-        trained_path = "/home/antonio/workspaces/pointpillars_UAV_ros2_ws/models_and_datasets/SPointPillars_Results_15/checkpoints/epoch_15.pth"
-        model = PointPillars(nclasses=1, max_num_points=100, Backbone_layer_strides=[1,2,2],upsample_strides=[1,2,4]).cuda()
-        
+    # Init model (Using default configuration for inference)
+    # Using cpu/cuda based on availability
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    model = PointPillars(nclasses=1).to(device)
     load_model_checkpoint(trained_path, model)
     model.eval()
 
     with torch.no_grad():
-        while True:
-            # Remove points from point cloud which is out of range 
-            pc = point_range_filter(pc, pcd_limit_range)
+        # Remove points from point cloud which is out of range 
+        pc = point_range_filter(pc, pcd_limit_range)
 
-            # Run the model
-            result = model(batched_pts=pc, mode='test')
+        # Convert to tensor and move to device
+        pc_tensor = torch.from_numpy(pc).to(device)
 
-            # Remove predictions which is out of range
-            result_filter = keep_bbox_from_lidar_range(result, pcd_limit_range)
+        # Run the model
+        # The model expects a list of tensors for the batch
+        result = model(batched_pts=[pc_tensor], mode='test')
 
-            # Split up results
-            lidar_bboxes = result_filter['lidar_bboxes']
-            labels, scores = result_filter['labels'], result_filter['scores']
+        # result is likely a list (batch size 1), get the first item
+        if isinstance(result, list):
+            result = result[0]
 
-main()
+        # Remove predictions which is out of range
+        result_filter = keep_bbox_from_lidar_range(result, pcd_limit_range)
+
+        # Split up results
+        lidar_bboxes = result_filter['lidar_bboxes']
+        labels, scores = result_filter['labels'], result_filter['scores']
+        
+        print("\n--- Inference Results ---")
+        print(f"Detected {len(labels)} objects.")
+        if len(labels) > 0:
+            print("Scores:", scores.cpu().numpy())
+            print("BBoxes:", lidar_bboxes.cpu().numpy())
+        else:
+            print("No objects detected in this frame.")
+
+if __name__ == '__main__':
+    main()
