@@ -47,11 +47,11 @@ def main():
     # Init model (Choose small or large model)
     if True:
         # Ssmall model 
-        trained_path = "/home/antonio/workspaces/pointpillars_UAV_ros2_ws/src/APointPillars_Results_10/checkpoints/epoch_10.pth" 
+        trained_path = "/home/antonio/workspaces/pointpillars_UAV_ros2_ws/models_and_datasets/APointPillars_Results_10/checkpoints/epoch_10.pth" 
         model = PointPillars(nclasses=1).cuda()
     else:
         # Large model
-        trained_path = "/home/antonio/workspaces/pointpillars_UAV_ros2_ws/src/SPointPillars_Results_15/checkpoints/epoch_15.pth"
+        trained_path = "/home/antonio/workspaces/pointpillars_UAV_ros2_ws/models_and_datasets/SPointPillars_Results_15/checkpoints/epoch_15.pth"
         model = PointPillars(nclasses=1, max_num_points=100, Backbone_layer_strides=[1,2,2],upsample_strides=[1,2,4]).cuda()
         
     load_model_checkpoint(trained_path, model)
