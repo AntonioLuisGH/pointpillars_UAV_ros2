@@ -4,16 +4,6 @@ This ROS2 package provides a real-time implementation of PointPillars for 3D obj
 
 This software was developed as part of a **Counter-UAV System project at Aalborg University**.
 
-## 📋 Project Context
-
-This package is a core component of a larger UAV tracking and neutralization system. The full architecture operates as follows:
-
-1.  **Detection:** An Acoustic Sensor Array estimates the Direction of Arrival (DoA) of an incoming drone.
-2.  **Tracking:** A Pan-Tilt Unit (PTU) uses the DoA to physically point a narrow-FOV conical LiDAR towards the target.
-3.  **Classification (This Package):** The LiDAR captures point clouds, and this PointPillars node detects and estimates the 3D bounding box of the drone.
-4.  **Fusion:** A Particle Filter fuses acoustic and spatial data to maintain a lock.
-5.  **Neutralization:** A pneumatic gravel cannon is targeted based on the estimated position.
-
 ## ✨ Key Features
 
 *   **Real-time Inference:** Runs PointPillars efficiently on CUDA-enabled GPUs.
