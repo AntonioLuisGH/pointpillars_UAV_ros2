@@ -246,7 +246,7 @@ class PointPillarsNode(Node):
             marker.color.a = 0.5 
 
             marker.lifetime.sec = 0
-            marker.lifetime.nanosec = 200000000 
+            marker.lifetime.nanosec = 100000000 
 
             marker_array.markers.append(marker)
 
