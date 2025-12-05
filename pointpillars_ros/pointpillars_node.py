@@ -29,13 +29,19 @@ class PointPillarsNode(Node):
 
         # --- Parameters ---
         self.declare_parameter('model_path', '')
-        self.declare_parameter('input_topic', '/lidar/avia') 
-        self.declare_parameter('lidar_frame', 'lidar_link') 
-        self.declare_parameter('world_frame', 'drone_world') 
+        self.declare_parameter('input_topic', '/livox/lidar') 
+        self.declare_parameter('lidar_frame', 'livox_frame') 
+        self.declare_parameter('world_frame', 'world') 
         self.declare_parameter('score_threshold', 0.3)
         self.declare_parameter('normalize_intensity', False)
-        self.declare_parameter('model_type', 'small') # NEW: 'small' or 'large'
+        self.declare_parameter('model_type', 'large')
         
+        # Correction for Training Height vs Real Height
+        self.declare_parameter('ground_height_offset', 0.0) 
+        
+        # NEW: Manual Intensity Scaling (to match Sim "Red" color)
+        self.declare_parameter('intensity_scale', 1.0)
+
         model_path = self.get_parameter('model_path').get_parameter_value().string_value
         self.input_topic = self.get_parameter('input_topic').get_parameter_value().string_value
         self.lidar_frame = self.get_parameter('lidar_frame').get_parameter_value().string_value
@@ -43,6 +49,8 @@ class PointPillarsNode(Node):
         self.score_thresh = self.get_parameter('score_threshold').get_parameter_value().double_value
         self.normalize_intensity = self.get_parameter('normalize_intensity').get_parameter_value().bool_value
         self.model_type = self.get_parameter('model_type').get_parameter_value().string_value
+        self.z_offset = self.get_parameter('ground_height_offset').get_parameter_value().double_value
+        self.int_scale = self.get_parameter('intensity_scale').get_parameter_value().double_value
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -50,7 +58,7 @@ class PointPillarsNode(Node):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.get_logger().info(f"Using device: {self.device}")
 
-        # --- Model Initialization based on Type ---
+        # --- Model Initialization ---
         if self.model_type == 'large':
             self.get_logger().info("Initializing LARGE (Advanced) PointPillars Model")
             self.model = PointPillars(nclasses=1, 
@@ -75,9 +83,11 @@ class PointPillarsNode(Node):
             10)
         
         self.publisher_ = self.create_publisher(MarkerArray, 'pointpillars_bbox', 10)
+        
+        #  RVIZ TO DEBUG ORIENTATION (It has corrected timestamps!)
         self.debug_pub_ = self.create_publisher(PointCloud2, '/debug/input_cloud', 10)
         
-        self.get_logger().info(f"Node Init. Intensity Norm: {self.normalize_intensity}")
+        self.get_logger().info(f"Node Init. Int Norm: {self.normalize_intensity}, Scale: {self.int_scale}, Z-Off: {self.z_offset}m")
 
     def load_pretrained_model(self, trained_path):
         ckpt = torch.load(trained_path, map_location='cpu', weights_only=False)
@@ -95,12 +105,15 @@ class PointPillarsNode(Node):
         self.model.load_state_dict(filtered_state, strict=False)
         self.get_logger().info("Checkpoint loaded successfully.")
 
-    def get_transform_matrix(self, target_frame, source_frame, time):
+    def get_transform_matrix(self, target_frame, source_frame):
         try:
-            if not self.tf_buffer.can_transform(target_frame, source_frame, time):
+            # FIX: Use Time() (zero) to get the LATEST available transform.
+            # asking for specific 'now' often causes ExtrapolationExceptions due to latency.
+            if not self.tf_buffer.can_transform(target_frame, source_frame, rclpy.time.Time()):
+                self.get_logger().warn(f"Waiting for TF {target_frame} -> {source_frame}...", throttle_duration_sec=2.0)
                 return None, None, None
 
-            t = self.tf_buffer.lookup_transform(target_frame, source_frame, time)
+            t = self.tf_buffer.lookup_transform(target_frame, source_frame, rclpy.time.Time())
             
             trans = np.array([t.transform.translation.x, 
                               t.transform.translation.y, 
@@ -121,18 +134,42 @@ class PointPillarsNode(Node):
             
             return T, R, trans
 
-        except (LookupException, ConnectivityException, ExtrapolationException):
+        except (LookupException, ConnectivityException, ExtrapolationException) as e:
+            self.get_logger().error(f"TF Error: {e}")
             return None, None, None
 
+    def get_yaw_from_matrix(self, R):
+        return np.arctan2(R[1, 0], R[0, 0])
+
     def listener_callback(self, msg):
+        # --- TIME SYNC FIX ---
+        # Overwrite timestamp to NOW so it matches the TF system time
+        now = self.get_clock().now()
+        msg.header.stamp = now.to_msg()
+
+        # 1. Get Lidar -> World Transform (Latest available)
         _, R_lidar_to_world, T_lidar_to_world = self.get_transform_matrix(
             self.world_frame, 
-            self.lidar_frame, 
-            rclpy.time.Time())
+            self.lidar_frame)
         
         if R_lidar_to_world is None:
             return
 
+        # 2. Extract Drone Heading (Yaw)
+        yaw_global = self.get_yaw_from_matrix(R_lidar_to_world)
+        
+        # 3. Create "Inverse Yaw" Matrix (Stabilizer)
+        c, s = np.cos(-yaw_global), np.sin(-yaw_global)
+        R_world_to_stabilized = np.array([
+            [c, -s, 0],
+            [s,  c, 0],
+            [0,  0, 1]
+        ])
+
+        # 4. Compute Final Transform: Lidar -> Stabilized
+        R_lidar_to_stabilized = np.dot(R_world_to_stabilized, R_lidar_to_world)
+
+        # 5. Read Points
         points_list = []
         try:
             for point in point_cloud2.read_points(msg, field_names=['x', 'y', 'z'], skip_nans=True):
@@ -147,6 +184,9 @@ class PointPillarsNode(Node):
         try:
             for p in point_cloud2.read_points(msg, field_names=['intensity'], skip_nans=True):
                 val = p[0]
+                # Apply Scaling first
+                val = val * self.int_scale
+                
                 if self.normalize_intensity:
                     val = val / 255.0
                 intensities.append(val)
@@ -155,21 +195,33 @@ class PointPillarsNode(Node):
 
         pc_lidar = np.array(points_list, dtype=np.float32) 
         
-        # Apply Rotation
-        pc_aligned = np.dot(R_lidar_to_world, pc_lidar.T).T
+        # 6. Apply Rotation (Lidar -> Stabilized)
+        pc_aligned = np.dot(R_lidar_to_stabilized, pc_lidar.T).T
+        
+        # 7. Apply Z-Correction
+        pc_aligned[:, 2] += self.z_offset
         
         # Stack intensity
         pc_input = np.hstack((pc_aligned, np.array(intensities).reshape(-1, 1)))
 
-        # --- DEBUG: Publish what the model sees ---
+        # --- DEBUG VISUALIZATION ---
         if self.debug_pub_.get_subscription_count() > 0:
             header = Header()
             header.frame_id = self.world_frame 
             header.stamp = msg.header.stamp
             
-            # Debug points back in world coordinates (add translation)
-            debug_pts = pc_aligned + T_lidar_to_world
-            debug_data = np.hstack((debug_pts, np.array(intensities).reshape(-1, 1)))
+            # Rotate back to World
+            R_stabilized_to_world = R_world_to_stabilized.T 
+            
+            # Remove Z-Correction for visualization
+            debug_pts_input_frame = pc_aligned.copy()
+            debug_pts_input_frame[:, 2] -= self.z_offset
+            
+            # Rotate and Translate to World
+            debug_pts_world = np.dot(R_stabilized_to_world, debug_pts_input_frame.T).T
+            debug_pts_world += T_lidar_to_world
+            
+            debug_data = np.hstack((debug_pts_world, np.array(intensities).reshape(-1, 1)))
             
             debug_msg = point_cloud2.create_cloud(header, [
                 PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
@@ -178,7 +230,7 @@ class PointPillarsNode(Node):
                 PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
             ], debug_data)
             self.debug_pub_.publish(debug_msg)
-        # ------------------------------------------
+        # ---------------------------
 
         # Filter
         pcd_limit_range = np.array([0, -40, -40, 70, 40, 40], dtype=np.float32)
@@ -198,7 +250,6 @@ class PointPillarsNode(Node):
 
         if isinstance(result, list):
             result = result[0]
-
         if isinstance(result, tuple):
             return 
 
@@ -212,16 +263,36 @@ class PointPillarsNode(Node):
         delete_marker.action = Marker.DELETEALL
         marker_array.markers.append(delete_marker)
 
+        # R_z(yaw_global)
+        c_back, s_back = np.cos(yaw_global), np.sin(yaw_global)
+        R_stabilized_to_world = np.array([
+            [c_back, -s_back, 0],
+            [s_back,  c_back, 0],
+            [0,       0,      1]
+        ])
+
         for i in range(len(scores)):
             if scores[i] < self.score_thresh:
                 continue
 
             bbox = lidar_bboxes[i]
             
-            pos_aligned = np.array([bbox[0], bbox[1], bbox[2]])
-            pos_world = pos_aligned + T_lidar_to_world
+            # 1. Get box center in Stabilized Frame
+            pos_stabilized = np.array([bbox[0], bbox[1], bbox[2]])
+            
+            # 2. Remove Z-Correction
+            pos_stabilized[2] -= self.z_offset
+            
+            # 3. Rotate to World
+            pos_world_rel = np.dot(R_stabilized_to_world, pos_stabilized)
+            
+            # 4. Add Drone Position
+            pos_world = pos_world_rel + T_lidar_to_world
 
-            q_final = self.yaw_to_quaternion(bbox[6])
+            # Orientation
+            yaw_bbox = bbox[6]
+            final_yaw = yaw_bbox + yaw_global
+            q_final = self.yaw_to_quaternion(final_yaw)
 
             marker = Marker()
             marker.header.frame_id = self.world_frame
@@ -246,7 +317,7 @@ class PointPillarsNode(Node):
             marker.color.a = 0.5 
 
             marker.lifetime.sec = 0
-            marker.lifetime.nanosec = 100000000 
+            marker.lifetime.nanosec = 50000000 
 
             marker_array.markers.append(marker)
 
